@@ -420,11 +420,26 @@ async def find_latest_id(bot: Bot, chat_id: int, anchor_id: int, username: Optio
 async def clean_after(
     bot: Bot, chat_id: int, anchor_id: int, username: Optional[str] = None
 ) -> tuple[int, int]:
-    """Ana mesajdan SONRAKİ (daha yeni) her şeyi siler; (taranan, atlanan_grup) döner."""
-    latest = await find_latest_id(bot, chat_id, anchor_id, username)
-    if latest <= anchor_id:
-        return 0, 0
-    return await sweep(bot, chat_id, start=latest, stop=anchor_id)
+    """Ana mesajdan SONRAKİ (daha yeni) her şeyi siler; (taranan, atlanan_grup) döner.
+
+    Tarama bir turda sınıra takılabilir (yedek reaksiyon taraması sınırlı) ya da
+    temizlik sürerken kanala yeni mesaj düşebilir. Bu yüzden yeni bir şey
+    bulunamayana kadar tur tekrarlanır — tek komutla iş gerçekten biter.
+    """
+    total_done = 0
+    total_failed = 0
+    ceiling = anchor_id
+    for _ in range(12):
+        latest = await find_latest_id(bot, chat_id, ceiling, username)
+        if latest <= ceiling:
+            break
+        done, failed = await sweep(bot, chat_id, start=latest, stop=ceiling)
+        total_done += done
+        total_failed += failed
+        ceiling = latest  # bir sonraki tur yalnızca bunun ÜSTÜNE bakar
+        if failed:
+            break  # limitlere takıldık; kullanıcıya bildirilecek
+    return total_done, total_failed
 
 
 async def clean_before(bot: Bot, chat_id: int, anchor_id: int) -> tuple[int, int]:

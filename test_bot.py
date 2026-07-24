@@ -146,6 +146,34 @@ def test_sweep_floodda_devam_eder():
     assert min(silinen) == 1001 and max(silinen) == 1250   # anchor(1000) korunur
 
 
+def test_clean_after_tur_tekrari():
+    """clean_after: tarama sınıra takılsa bile turları tekrarlayıp TÜM aralığı bitirmeli."""
+    silinen = []
+    # sahte kanal: anchor 1000, gerçek son mesaj 1000+1200 -> tek turda bulunamaz
+    GERCEK_SON = 2200
+
+    async def sahte_find(bot_, chat_id, floor, username=None):
+        return min(floor + 500, GERCEK_SON)   # her tur en fazla 500 ilerleyebiliyor
+
+    class FakeBot:
+        id = 1
+
+        async def delete_messages(self, chat_id, message_ids):
+            silinen.extend(message_ids)
+
+    orj = bot.find_latest_id
+    bot.find_latest_id = sahte_find
+    try:
+        done, failed = asyncio.run(bot.clean_after(FakeBot(), -100123, 1000))
+    finally:
+        bot.find_latest_id = orj
+
+    assert failed == 0, failed
+    assert done == GERCEK_SON - 1000, done              # 1200 mesajın tamamı
+    assert min(silinen) == 1001 and max(silinen) == GERCEK_SON
+    assert len(set(silinen)) == GERCEK_SON - 1000        # tekrar yok, boşluk yok
+
+
 if __name__ == "__main__":
     test_parse()
     test_normalize_username()
@@ -153,4 +181,5 @@ if __name__ == "__main__":
     test_mt_scan()
     test_mt_scan_hata_yutulmaz()
     test_sweep_floodda_devam_eder()
+    test_clean_after_tur_tekrari()
     print("OK - tum testler gecti")
