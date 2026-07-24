@@ -63,11 +63,25 @@ Bot çalıştığı sürece komutları dinler. Sunucuda 7/24 çalıştırmak ist
 
 ## Nasıl çalışıyor?
 
-Bot API kanal geçmişini okuyamaz; ama kanal mesaj ID'leri sıralı arttığı için bot,
-son mesaj ID'sini öğrenmek üzere kanala **sessiz bir sonda mesajı** atıp hemen siler.
-Sonra `ana mesaj ID + 1` ile `son ID` arasındaki tüm ID'leri 90'lık gruplar halinde
-`deleteMessages` ile temizler. Arada zaten silinmiş ID'ler varsa Telegram bunları
-kendiliğinden atlar, sorun çıkmaz.
+Bot API kanal geçmişini okuyamaz; ama kanal mesaj ID'leri sıralı arttığı için bot
+son mesaj ID'sini **kanala hiçbir şey atmadan** bulur:
+
+1. **MTProto taraması** (API_ID/API_HASH varsa): 100'lük pencerelerle mesaj varlığı
+   sorgulanır. Önceki temizliklerden kalan silinmiş-ID boşlukları aşılır.
+2. **Reaksiyon taraması** (yedek): boş reaksiyon listesi gönderilerek mesajın var olup
+   olmadığı anlaşılır — kanalda hiçbir iz bırakmaz.
+
+Sonra `ana mesaj ID + 1` ile `son ID` arasındaki tüm ID'ler **90'lık gruplar** halinde
+`deleteMessages` ile temizlenir. Arada zaten silinmiş ID'ler varsa Telegram bunları
+kendiliğinden atlar.
+
+**Flood (hız) limiti:** Telegram limit koyduğunda bot **bekler ve aynı 90'lık grubu
+yeniden dener** — tek tek silmeye düşmez (o, limiti 90 katına çıkarıp mesajların
+atlanmasına yol açıyordu). Tarama sınıra takılsa bile turlar tekrarlanır, böylece tek
+komutla ana mesaja kadar her şey temizlenir.
+
+> ℹ️ Bot kanala **hiçbir mesaj göndermez**. Tüm bildirimler sana özelden gelir ve
+> temizlik sırasında ara mesaj atılmaz; yalnızca iş bitince tek bir özet gönderilir.
 
 ## Sorun giderme
 
