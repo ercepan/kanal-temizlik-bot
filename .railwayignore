@@ -1,0 +1,6 @@
+.venv/
+.env
+__pycache__/
+son_isler.json
+son_gorulen.json
+test_bot.py
