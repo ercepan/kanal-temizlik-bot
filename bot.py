@@ -52,11 +52,17 @@ except ModuleNotFoundError:
 
 BATCH_SIZE = 90        # Telegram limiti 100; garanti olsun diye 90
 BATCH_DELAY = 0.4      # gruplar arası bekleme (saniye) — flood koruması
-PROGRESS_EVERY = 5     # kaç grupta bir ilerleme mesajı güncellenir
 DATA_FILE = Path(__file__).with_name("son_isler.json")
 SEEN_FILE = Path(__file__).with_name("son_gorulen.json")
-FRONTIER_MISS = 3      # art arda bu kadar boş ID görünce "son mesaj bu" der
-FRONTIER_CAP = 150     # sessiz taramada en fazla bu kadar ID kontrol edilir
+
+# Son mesaj ID'sini sessizce bulma ayarları:
+MTPROTO_WINDOW = 100        # tek MTProto çağrısında kontrol edilen ardışık ID sayısı
+EMPTY_TOLERANCE = 20000     # art arda bu kadar boş ID görünce "son mesaj bu" der
+                            # (önceki temizliklerden kalan bu boyuta kadar silinmiş
+                            # ID boşlukları aşılır; 100'lük pencerelerle taranır)
+SCAN_CALL_CAP = 3000        # tarama başına en fazla MTProto çağrısı (~300k ID)
+REACTION_TOLERANCE = 300    # reaksiyon yedeğinde boşluk toleransı (tek tek kontrol, dar tutulur)
+REACTION_CALL_CAP = 500     # reaksiyon yedeğinde en fazla çağrı
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,7 +121,8 @@ START_TEXT = (
     "/tekrar — son işi aynı ana mesajla yeniden başlat\n"
     "/kanaldanat — kanaldan kişi at (örn: <code>/kanaldanat @kullanici</code>; "
     "isim çözülemezse listeden seçtirir)\n\n"
-    "ℹ️ Mesajları 90'lık gruplar halinde, flood korumalı silerim.\n"
+    "ℹ️ Mesajları 90'lık gruplar halinde, ana mesaja kadar <b>hepsini</b> silerim; "
+    "flood limitine takılırsam bekler, kaldığım yerden devam ederim.\n"
     "⚠️ Silinen mesajlar geri getirilemez!"
 )
 
@@ -197,116 +204,234 @@ def confirm_kb() -> InlineKeyboardMarkup:
     )
 
 
-async def safe_edit(msg: Message, text: str) -> None:
-    for _ in range(2):
-        try:
-            await msg.edit_text(text)
-            return
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.5)
-        except TelegramBadRequest:
-            return
-
-
 # --------------------------------------------------------------- silme işi
 
-async def delete_batch(bot: Bot, chat_id: int, batch: list[int]) -> None:
-    """Bir grubu siler; flood beklemesi ve toplu silme patlarsa tek tek dener."""
+async def delete_batch(bot: Bot, chat_id: int, batch: list[int]) -> bool:
+    """Bir 90'lık grubu siler; işlendiyse True döner.
+
+    Flood limitine takılınca TEK DOĞRU HAMLE beklemektir: Telegram'ın söylediği
+    süre kadar bekleyip AYNI grubu yeniden deneriz. (Tek tek silmeye düşmek floodu
+    90 katına çıkarır — eski sürümdeki 'sadece ilk 90 siliniyor' hatasının kökü buydu.)
+    Tek tek silme yalnızca 'grupta silinemeyen mesaj var' (BadRequest) durumunda kullanılır.
+    """
     if not batch:
-        return
-    for _ in range(3):
+        return True
+    tries = 0
+    while True:
         try:
             await bot.delete_messages(chat_id=chat_id, message_ids=batch)
-            return
+            return True
         except TelegramRetryAfter as e:
-            log.info("Flood limiti: %s sn bekleniyor", e.retry_after)
-            await asyncio.sleep(e.retry_after + 1)
+            tries += 1
+            if tries >= 8:
+                log.warning("Grup %s..%s: flood 8 kez üst üste, grup atlanıyor", batch[0], batch[-1])
+                return False
+            wait = min(float(e.retry_after) + 1.0, 120.0)
+            log.info("Flood limiti: %.0f sn bekleniyor (chat=%s)", wait, chat_id)
+            await asyncio.sleep(wait)
         except TelegramBadRequest:
-            break  # toplu silme olmadı -> tek tek dene
+            break  # grupta silinemeyen mesaj olabilir -> tek tek ele
+        except TelegramForbiddenError:
+            raise
+        except Exception:  # ağ kopması vb. geçici hatalar temizliği ÖLDÜRMEZ
+            tries += 1
+            if tries >= 8:
+                log.exception("Grup %s..%s: kalıcı ağ hatası, grup atlanıyor", batch[0], batch[-1])
+                return False
+            log.warning("Geçici hata, 3 sn sonra aynı grup yeniden denenecek")
+            await asyncio.sleep(3)
+
     for mid in batch:
-        try:
-            await bot.delete_message(chat_id, mid)
-        except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 1)
+        for _ in range(4):
             try:
                 await bot.delete_message(chat_id, mid)
-            except (TelegramBadRequest, TelegramRetryAfter):
-                pass
-        except TelegramBadRequest:
-            pass  # zaten yok / silinemez -> atla
-        await asyncio.sleep(0.03)
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(min(float(e.retry_after) + 1.0, 120.0))
+            except TelegramBadRequest:
+                break  # zaten yok / silinemez -> atla
+            except TelegramForbiddenError:
+                raise
+            except Exception:
+                await asyncio.sleep(2)
+        await asyncio.sleep(0.05)
+    return True
 
 
-async def sweep(bot: Bot, chat_id: int, start: int, stop: int, status: Optional[Message] = None) -> int:
-    """start'tan stop'a (stop hariç) tüm ID aralığını temizler, sayaç döner."""
+async def sweep(bot: Bot, chat_id: int, start: int, stop: int) -> tuple[int, int]:
+    """start'tan stop'a (stop HARİÇ) tüm ID aralığını 90'ar 90'ar temizler.
+
+    Hiçbir grup hatası taramayı durdurmaz; (taranan_mesaj, atlanan_grup) döner.
+    """
     total = max(0, start - stop)
     done = 0
-    for i, batch in enumerate(iter_batches(start, stop)):
-        await delete_batch(bot, chat_id, batch)
-        done += len(batch)
-        if status is not None and (i + 1) % PROGRESS_EVERY == 0 and done < total:
-            await safe_edit(
-                status, f"🧹 Siliniyor... {done}/{total} (%{done * 100 // total})"
-            )
+    failed = 0
+    for batch in iter_batches(start, stop):
+        try:
+            ok = await delete_batch(bot, chat_id, batch)
+        except TelegramForbiddenError:
+            raise  # kanaldan atılmışız — devam etmenin anlamı yok
+        except Exception:
+            log.exception("Grup beklenmedik şekilde patladı, atlanıp devam ediliyor")
+            ok = False
+        if ok:
+            done += len(batch)
+        else:
+            failed += 1
+            if failed >= 20:
+                log.warning("20 grup üst üste başarısız; tarama durduruluyor (chat=%s)", chat_id)
+                break
         if done < total:
             await asyncio.sleep(BATCH_DELAY)
-    return done
+    return done, failed
 
+
+# ------------------------------------------- son mesaj ID'sini SESSİZCE bulma
+#
+# Kanala HİÇBİR mesaj atılmaz. Sıra:
+#   1) MTProto (telethon) ile toplu varlık kontrolü — tek çağrıda 100 ID, boşluklara
+#      dayanıklı (spot taraması), tamamen görünmez.
+#   2) MTProto yoksa: boş reaksiyon listesiyle tek tek varlık kontrolü (o da görünmez).
+# Eski "kanala 🧹 at, hemen sil" son-çare yolu TAMAMEN KALDIRILDI.
 
 async def message_exists(bot: Bot, chat_id: int, message_id: int) -> bool:
-    """Mesaj var mı? Boş reaksiyon listesi göndererek kontrol eder — kanalda hiçbir iz bırakmaz."""
-    while True:
+    """Mesaj var mı? Boş reaksiyon listesiyle kontrol — kanalda hiçbir iz bırakmaz.
+
+    Kararsız kalırsa True der: fazladan ID taramak zararsızdır (deleteMessages
+    olmayanları kendiliğinden atlar) ama az taramak mesaj bırakır.
+    """
+    for _ in range(6):
         try:
             await bot.set_message_reaction(chat_id=chat_id, message_id=message_id, reaction=[])
             return True
         except TelegramRetryAfter as e:
-            await asyncio.sleep(e.retry_after + 0.5)
+            await asyncio.sleep(min(float(e.retry_after) + 0.5, 60.0))
         except TelegramBadRequest as e:
             s = str(e).lower()
             return not ("not found" in s or "message_id_invalid" in s)
+        except TelegramForbiddenError:
+            raise
+        except Exception:
+            await asyncio.sleep(2)
+    return True
 
 
-async def find_latest_id(bot: Bot, chat_id: int) -> int:
-    """Kanaldaki son mesaj ID'sini bulur.
+async def _mt_entity(client, chat_id: int, username: Optional[str]):
+    """Telethon için kanal entity'si: önce @kullanıcıadı, sonra ID tabanlı yollar."""
+    from telethon.tl.functions.channels import GetChannelsRequest
+    from telethon.tl.types import InputChannel, PeerChannel
 
-    Normal yol: kanal postlarından takip edilen ID'den başlayıp görünmez reaksiyon
-    kontrolüyle ileri tarama (tamamen sessiz). Takip verisi yoksa (ör. bot yeni
-    yeniden başladı ve kanala hiç post düşmedi) son çare olarak sessiz bildirimli
-    sonda mesajı atılıp anında silinir.
+    if username:
+        try:
+            return await client.get_entity(f"@{username.lstrip('@')}")
+        except Exception:
+            pass
+    s = str(chat_id)
+    internal = int(s[4:]) if s.startswith("-100") else chat_id
+    try:
+        return await client.get_input_entity(PeerChannel(internal))
+    except Exception:
+        pass
+    try:
+        res = await client(GetChannelsRequest([InputChannel(internal, 0)]))
+        if res.chats:
+            return res.chats[0]
+    except Exception:
+        pass
+    return None
+
+
+async def _mt_existing_ids(client, entity, ids: list[int]) -> Optional[set[int]]:
+    """Verilen ID'lerden kanalda var olanları döndürür; HATA durumunda None.
+
+    (Hata ile 'hiçbiri yok'u karıştırmamak kritik: None dönerse çağıran MTProto
+    yolunu bırakır, yanlış-küçük sonuç üretmez.)
     """
-    base = last_seen.get(chat_id, 0)
-    if base > 0:
-        latest, misses, nxt, steps = base, 0, base + 1, 0
-        while misses < FRONTIER_MISS and steps < FRONTIER_CAP:
-            if await message_exists(bot, chat_id, nxt):
-                latest, misses = nxt, 0
-            else:
-                misses += 1
-            nxt += 1
-            steps += 1
-        if steps < FRONTIER_CAP:
-            await remember_seen(chat_id, latest)
+    import telethon.errors as terr
+
+    for _ in range(4):
+        try:
+            msgs = await client.get_messages(entity, ids=ids)
+            return {m.id for m in msgs if m is not None}
+        except terr.FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds + 1, 60))
+        except Exception:
+            return None
+    return None
+
+
+async def _mt_find_latest(client, entity, floor: int) -> Optional[int]:
+    """floor'dan yukarı kanaldaki en yüksek mesaj ID'sini bulur; hata -> None.
+
+    100'lük pencerelerle YOĞUN tarama yapar: son bulunan mesajın üstünde
+    EMPTY_TOLERANCE kadar ardışık boş ID görmeden durmaz. Böylece önceki
+    temizliklerden kalan silinmiş-ID boşlukları mesaj kaçırmadan aşılır.
+    """
+    latest = floor
+    nxt = floor + 1
+    empty_run = 0
+    for _ in range(SCAN_CALL_CAP):
+        window = list(range(nxt, nxt + MTPROTO_WINDOW))
+        found = await _mt_existing_ids(client, entity, window)
+        if found is None:
+            return None
+        if found:
+            latest = max(latest, max(found))
+            empty_run = window[-1] - latest  # pencerenin son mesajdan sonraki boş kuyruğu
+        else:
+            empty_run += MTPROTO_WINDOW
+        if empty_run >= EMPTY_TOLERANCE:
             return latest
-        log.warning("Sessiz tarama sınıra takıldı, sonda mesajına dönülüyor: %s", chat_id)
-    probe = await bot.send_message(chat_id, "🧹", disable_notification=True)
-    await delete_batch(bot, chat_id, [probe.message_id])
-    await remember_seen(chat_id, probe.message_id)
-    return probe.message_id - 1
+        nxt = window[-1] + 1
+    return latest
 
 
-async def clean_after(bot: Bot, chat_id: int, anchor_id: int, status: Optional[Message] = None) -> int:
-    """Ana mesajdan SONRAKİ (daha yeni) her şeyi siler."""
-    latest = await find_latest_id(bot, chat_id)
+async def _reaction_find_latest(bot: Bot, chat_id: int, floor: int) -> int:
+    """MTProto yoksa yedek: reaksiyon kontrolüyle aynı yoğun tarama (tek tek,
+    o yüzden boşluk toleransı dar tutulur)."""
+    latest = floor
+    nxt = floor + 1
+    calls = 0
+    while calls < REACTION_CALL_CAP and (nxt - latest) <= REACTION_TOLERANCE:
+        calls += 1
+        if await message_exists(bot, chat_id, nxt):
+            latest = nxt
+        nxt += 1
+    return latest
+
+
+async def find_latest_id(bot: Bot, chat_id: int, anchor_id: int, username: Optional[str] = None) -> int:
+    """Kanaldaki son mesaj ID'sini kanala hiçbir şey atmadan bulur."""
+    floor = max(last_seen.get(chat_id, 0), anchor_id)
+    client = await _get_mtproto()
+    if client is not None:
+        entity = await _mt_entity(client, chat_id, username)
+        if entity is not None:
+            latest = await _mt_find_latest(client, entity, floor)
+            if latest is not None:
+                await remember_seen(chat_id, latest)
+                return latest
+        log.info("MTProto taraması olmadı, reaksiyon yedeğine geçiliyor (chat=%s)", chat_id)
+    latest = await _reaction_find_latest(bot, chat_id, floor)
+    await remember_seen(chat_id, latest)
+    return latest
+
+
+async def clean_after(
+    bot: Bot, chat_id: int, anchor_id: int, username: Optional[str] = None
+) -> tuple[int, int]:
+    """Ana mesajdan SONRAKİ (daha yeni) her şeyi siler; (taranan, atlanan_grup) döner."""
+    latest = await find_latest_id(bot, chat_id, anchor_id, username)
     if latest <= anchor_id:
-        return 0
-    return await sweep(bot, chat_id, start=latest, stop=anchor_id, status=status)
+        return 0, 0
+    return await sweep(bot, chat_id, start=latest, stop=anchor_id)
 
 
-async def clean_before(bot: Bot, chat_id: int, anchor_id: int, status: Optional[Message] = None) -> int:
-    """Ana mesajdan ÖNCEKİ (daha eski) her şeyi siler."""
+async def clean_before(bot: Bot, chat_id: int, anchor_id: int) -> tuple[int, int]:
+    """Ana mesajdan ÖNCEKİ (daha eski) her şeyi siler; (taranan, atlanan_grup) döner."""
     if anchor_id <= 1:
-        return 0
-    return await sweep(bot, chat_id, start=anchor_id - 1, stop=0, status=status)
+        return 0, 0
+    return await sweep(bot, chat_id, start=anchor_id - 1, stop=0)
 
 
 # --------------------------------------------------- @kullanıcıadı çözümleme
@@ -314,34 +439,45 @@ async def clean_before(bot: Bot, chat_id: int, anchor_id: int, status: Optional[
 # Bot API @kullanıcıadı -> kişi çözmeye izin vermez; API_ID/API_HASH tanımlıysa
 # aynı bot token'ıyla MTProto üzerinden çözeriz. Tanımlı değilse None döner ve
 # akış kişi seçme butonuna düşer.
-_mtproto = None  # None: henüz açılmadı, False: açılamadı (tekrar deneme)
+_mtproto = None            # açık istemci ya da None
 _mtproto_lock = asyncio.Lock()
+_mtproto_retry_ts = 0.0    # başarısız denemeden sonra bu zamana kadar yeniden denenmez
+MTPROTO_COOLDOWN = 300     # saniye — geçici bir hata MTProto'yu kalıcı kapatmasın
 
 
 async def _get_mtproto():
-    global _mtproto
-    if _mtproto is False:
-        return None
+    global _mtproto, _mtproto_retry_ts
     api_id = os.getenv("API_ID", "").strip()
     api_hash = os.getenv("API_HASH", "").strip()
     token = os.getenv("BOT_TOKEN", "").strip()
     if not (api_id.isdigit() and api_hash and token):
         return None
     async with _mtproto_lock:
-        if _mtproto is None:
-            try:
-                from telethon import TelegramClient
-                from telethon.sessions import MemorySession
+        if _mtproto is not None:
+            return _mtproto
+        if time.time() < _mtproto_retry_ts:
+            return None
+        client = None
+        try:
+            from telethon import TelegramClient
+            from telethon.sessions import MemorySession
 
-                client = TelegramClient(MemorySession(), int(api_id), api_hash)
-                await client.start(bot_token=token)
-                _mtproto = client
-                log.info("MTProto çözümleyici hazır")
-            except Exception:
-                log.exception("MTProto istemcisi açılamadı — kişi seçici kullanılacak")
-                _mtproto = False
-                return None
-    return _mtproto or None
+            client = TelegramClient(MemorySession(), int(api_id), api_hash)
+            await asyncio.wait_for(client.start(bot_token=token), timeout=25)
+            _mtproto = client
+            log.info("MTProto çözümleyici hazır")
+            return _mtproto
+        except Exception:
+            log.exception(
+                "MTProto istemcisi açılamadı — %s sn sonra yeniden denenecek", MTPROTO_COOLDOWN
+            )
+            _mtproto_retry_ts = time.time() + MTPROTO_COOLDOWN
+            if client is not None:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+            return None
 
 
 async def resolve_user(username: str) -> Optional[tuple[int, str]]:
@@ -572,7 +708,12 @@ async def prepare_job(
                     "Yine de bu ID'yi sınır kabul edebilirim.\n\n"
                 )
 
-    job = {"chat_id": chat.id, "anchor_id": anchor_id, "title": chat.title or str(chat.id)}
+    job = {
+        "chat_id": chat.id,
+        "anchor_id": anchor_id,
+        "title": chat.title or str(chat.id),
+        "username": chat.username,  # sessiz MTProto taraması için (özel kanalda None)
+    }
     pending[user_id] = job
     await save_last_job(user_id, job)
 
@@ -661,30 +802,46 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
     active_chats.add(chat_id)
     try:
         if action == "after":
-            deleted = await clean_after(bot, chat_id, anchor_id)
+            deleted, failed = await clean_after(
+                bot, chat_id, anchor_id, job.get("username")
+            )
         else:
-            deleted = await clean_before(bot, chat_id, anchor_id)
-        if deleted <= 0:
+            deleted, failed = await clean_before(bot, chat_id, anchor_id)
+        if deleted <= 0 and failed == 0:
             text = "✅ Silinecek mesaj yoktu; orası zaten temiz."
         else:
             text = (
                 f"✅ Bitti! ~<b>{deleted}</b> mesajlık aralık temizlendi.\n"
                 f"🎯 Ana mesaj (<code>{anchor_id}</code>) yerinde duruyor."
             )
-        await bot.send_message(cb.from_user.id, text)
-        log.info("Temizlik bitti: chat=%s aralık=%s", chat_id, deleted)
+            if failed:
+                text += (
+                    f"\n⚠️ {failed} grup Telegram limitleri yüzünden atlandı — "
+                    "aynı linki gönderip bir daha başlatırsan kalanları da temizlerim."
+                )
+        try:
+            await bot.send_message(cb.from_user.id, text)
+        except Exception:  # rapor gönderilemese de temizlik tamamlanmıştır
+            log.warning("Sonuç mesajı gönderilemedi (user=%s)", cb.from_user.id)
+        log.info("Temizlik bitti: chat=%s taranan=%s atlanan_grup=%s", chat_id, deleted, failed)
     except TelegramForbiddenError:
-        await bot.send_message(
-            cb.from_user.id,
-            "❌ Kanala erişimim gitti (atılmış ya da yetkim alınmış olabilir).",
-        )
+        try:
+            await bot.send_message(
+                cb.from_user.id,
+                "❌ Kanala erişimim gitti (atılmış ya da yetkim alınmış olabilir).",
+            )
+        except Exception:
+            pass
     except Exception as e:  # noqa: BLE001
         log.exception("Temizlik sırasında hata")
-        await bot.send_message(
-            cb.from_user.id,
-            f"❌ Hata: <code>{html.escape(str(e))}</code>\n"
-            "Aynı linki gönderip yeniden başlatırsan kaldığı yerden toparlar.",
-        )
+        try:
+            await bot.send_message(
+                cb.from_user.id,
+                f"❌ Hata: <code>{html.escape(str(e))}</code>\n"
+                "Aynı linki gönderip yeniden başlatırsan kaldığı yerden toparlar.",
+            )
+        except Exception:
+            pass
     finally:
         active_chats.discard(chat_id)
 
