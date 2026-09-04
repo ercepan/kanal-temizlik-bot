@@ -88,14 +88,22 @@ _izin_lock = asyncio.Lock()
 _hesap_sahibi_id: Optional[int] = None   # USER_SESSION'ın sahibi; ilk kullanımda dolar
 
 
-def _izinlileri_oku() -> set[int]:
-    """Otomatik yetkilendirmeyi tetikleyebilecek kişiler.
+def izin_listesi_acik() -> bool:
+    """İzin listesi VARSAYILAN OLARAK KAPALI (IZIN_LISTESI=1 ile açılır).
 
-    Bot HERKESE AÇIK. Otomatik mod olmasaydı hesabın bir kanala girmesi için bir
-    insanın elle yetki vermesi gerekirdi; o adım doğal bir kapıydı. Otomatik modda
-    o kapı yok — bu liste onun yerini alır. Listede olmayan biri, kendi kanalının
-    yöneticisi bile olsa, hesabı kanalına otomatik çektiremez.
+    Kapalıyken otomatik modu, kendi kanalının yöneticisi olan herkes kullanabilir
+    — bot kişilerin bilmediği bir bot olduğu sürece pratik risk düşük, kurulum da
+    sürtünmesiz olur.
+
+    Açmayı düşün: bot herkese açık olarak duyurulursa. O zaman botu kendi kanalına
+    ekleyen bir yabancı, bağlı hesabı kendi kanalına çektirebilir; hesap oraya girip
+    silme yapar. Liste açıkken bunun için ayrıca sahibin onayı gerekir.
     """
+    return os.getenv("IZIN_LISTESI", "").strip() in ("1", "true", "evet")
+
+
+def _izinlileri_oku() -> set[int]:
+    """İzinli kişi numaraları (liste açıkken kullanılır)."""
     try:
         return {int(x) for x in json.loads(IZIN_FILE.read_text(encoding="utf-8"))}
     except (OSError, json.JSONDecodeError, ValueError, TypeError):
@@ -126,6 +134,8 @@ async def hesap_sahibi_id() -> Optional[int]:
 
 
 async def otomatik_izinli_mi(kisi_id: int) -> bool:
+    if not izin_listesi_acik():
+        return True
     return kisi_id == await hesap_sahibi_id() or kisi_id in _izinlileri_oku()
 
 
@@ -174,7 +184,6 @@ START_TEXT = (
     "<b>Komutlar:</b>\n"
     "/tekrar — son işi aynı ana mesajla yeniden başlat\n"
     "/kanaldanat — kanaldan kişi at (örn: <code>/kanaldanat @kullanici</code>)\n\n"
-    "<i>Bot sahibine özel:</i> /izinver, /izinal, /izinliler\n\n"
     "ℹ️ <b>Neden üç yetki?</b> Telegram botların 48 saatten eski mesajları "
     "silmesine izin vermiyor. Bu sınır kullanıcı hesaplarında yok. O yüzden iş "
     "geldiğinde bağlı hesabı kanala kendim alıp silme yetkisi veriyorum, iş "
@@ -1187,6 +1196,15 @@ async def on_izin(message: Message) -> None:
         return
     if message.from_user.id != sahip:
         await message.answer("⛔ Bu komut yalnızca bot sahibine açık.")
+        return
+
+    if not izin_listesi_acik():
+        await message.answer(
+            "ℹ️ İzin listesi <b>kapalı</b> — otomatik modu, kendi kanalının "
+            "yöneticisi olan herkes onaysız kullanabiliyor.\n\n"
+            "Açmak için sunucuda <code>IZIN_LISTESI=1</code> tanımlayıp botu "
+            "yeniden başlat. (Botu herkese duyurursan açmakta fayda var.)"
+        )
         return
 
     parcalar = (message.text or "").split()
