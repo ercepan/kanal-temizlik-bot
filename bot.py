@@ -70,6 +70,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("kanal-temizlik")
 
+from . import yedek
+
 dp = Dispatcher()
 
 pending: dict[int, dict] = {}      # user_id -> onay bekleyen temizlik işi
@@ -81,48 +83,57 @@ _seen_lock = asyncio.Lock()        # son_gorulen.json yazma koruması
 KICK_REQUEST_ID = 1001  # kişi seçme butonunun kimliği
 BOOT_TS = 0.0           # bot açılış zamanı; birikmiş eski özel mesajları elemek için
 
-
-def _load_seen() -> dict[int, int]:
-    try:
-        raw = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        return {int(k): int(v) for k, v in raw.items()}
-    except (OSError, json.JSONDecodeError, ValueError):
-        return {}
+# Yetkisi YEDEK hesap tarafından otomatik verilmiş kanallar. İş biter bitmez
+# yetki geri alınır ve kanaldan çıkılır — kalıcı yetki bırakılmaz.
+_yedek_verdi: set[int] = set()
 
 
-# kanal -> bilinen son mesaj ID'si (kanal postlarından takip edilir)
-last_seen: dict[int, int] = _load_seen()
+async def yedek_kapat(bot: Bot, chat_id: int) -> str:
+    """Otomatik verilen yetkiyi geri alır ve kanaldan çıkar. Rapor satırı döner."""
+    if chat_id not in _yedek_verdi:
+        return ""
+    _yedek_verdi.discard(chat_id)
 
-
-async def remember_seen(chat_id: int, message_id: int) -> None:
-    if message_id <= last_seen.get(chat_id, 0):
-        return
-    last_seen[chat_id] = message_id
-    async with _seen_lock:
+    client = await get_user_client()
+    ben_id = None
+    if client is not None:
         try:
-            SEEN_FILE.write_text(
-                json.dumps({str(k): v for k, v in last_seen.items()}), encoding="utf-8"
-            )
-        except OSError:
-            pass
+            ben_id = (await client.get_me()).id
+        except Exception:
+            log.debug("Hesap kimliği okunamadı", exc_info=True)
+
+    alindi = await yedek.yetki_al(bot, chat_id, ben_id) if ben_id else False
+    cikildi = await yedek.kanaldan_cik(client, chat_id) if client else False
+
+    if alindi and cikildi:
+        return "🔒 Yetkim geri alındı, kanaldan çıktım."
+    if alindi:
+        return "🔒 Yetkim geri alındı (kanaldan çıkamadım)."
+    return "⚠️ Yetkiyi geri alamadım — kanaldan elle kaldırman gerekebilir."
+
 
 START_TEXT = (
     "👋 Merhaba! Ben <b>kanal temizlik botuyum</b>.\n\n"
     "🎯 Bana bir <b>ana mesaj</b> gösterirsin; kanaldaki mesajları o mesaja kadar "
     "silerim. Ana mesaja dokunmam, orada dururum.\n\n"
-    "<b>Kurulum (tek seferlik):</b>\n"
-    "1️⃣ Beni kanalına <b>yönetici</b> olarak ekle\n"
-    "2️⃣ <b>Mesajları sil</b> yetkisini ver\n\n"
+    "<b>Kurulum — bir kez yapılır:</b>\n"
+    "Beni kanalına <b>yönetici</b> yap ve şu üç yetkiyi ver:\n"
+    "✅ Mesajları sil\n"
+    "✅ Yeni yöneticiler ekle\n"
+    "✅ Davet linki oluştur\n\n"
     "<b>Kullanım:</b>\n"
     "1️⃣ Kanalda ana mesaja bas → <i>Bağlantıyı Kopyala</i> → linki bana gönder\n"
     "     (ya da ana mesajı bana doğrudan <b>ilet/forward</b>)\n"
     "2️⃣ Çıkan butondan silme yönünü seç, gerisi bende 🧹\n\n"
     "<b>Komutlar:</b>\n"
     "/tekrar — son işi aynı ana mesajla yeniden başlat\n"
-    "/kanaldanat — kanaldan kişi at (örn: <code>/kanaldanat @kullanici</code>; "
-    "isim çözülemezse listeden seçtirir)\n\n"
-    "ℹ️ Mesajları 90'lık gruplar halinde, ana mesaja kadar <b>hepsini</b> silerim; "
-    "flood limitine takılırsam bekler, kaldığım yerden devam ederim.\n"
+    "/kanaldanat — kanaldan kişi at (örn: <code>/kanaldanat @kullanici</code>)\n\n"
+    "ℹ️ <b>Neden üç yetki?</b> Telegram botların 48 saatten eski mesajları "
+    "silmesine izin vermiyor. Bu sınır kullanıcı hesaplarında yok. O yüzden iş "
+    "geldiğinde bağlı hesabı kanala kendim alıp silme yetkisi veriyorum, iş "
+    "bitince yetkiyi geri alıp kanaldan çıkarıyorum — böylece her yaştaki mesaj "
+    "silinebiliyor ve kimse kalıcı yetki taşımıyor.\n\n"
+    "🔒 Silmeyi yalnızca o kanalın yöneticileri başlatabilir.\n"
     "⚠️ Silinen mesajlar geri getirilemez!"
 )
 
@@ -206,84 +217,261 @@ def confirm_kb() -> InlineKeyboardMarkup:
 
 # --------------------------------------------------------------- silme işi
 
-async def delete_batch(bot: Bot, chat_id: int, batch: list[int]) -> bool:
-    """Bir 90'lık grubu siler; işlendiyse True döner.
+TOO_OLD = "can't be deleted"
+
+# --------------------------------------------- kendi hesabınla silme (48s yok)
+#
+# Telegram BOTLARIN 48 saatten eski mesajları silmesine izin vermiyor. Kullanıcı
+# hesaplarında böyle bir sınır yok. USER_SESSION tanımlıysa silme işi kullanıcı
+# hesabı üzerinden yapılır; tanımlı değilse bot API'sine düşer (48s sınırıyla).
+#
+# Hız bilerek düşük tutuldu: hesabın kısıtlanmaması için.
+
+_user_client = None
+_user_lock = asyncio.Lock()
+_user_failed = False
+
+USER_BATCH = 90       # kullanıcı hesabı da tek çağrıda ~100 mesaj siliyor
+USER_GAP = 1.0        # gruplar arası bekleme — hesap güvenliği için yavaş
+
+
+async def get_user_client():
+    """Kullanıcı hesabı istemcisi; yoksa/açılamazsa None."""
+    global _user_client, _user_failed
+    if _user_failed:
+        return None
+    if _user_client is not None:
+        return _user_client
+    session = os.getenv("USER_SESSION", "").strip()
+    api_id = os.getenv("API_ID", "").strip()
+    api_hash = os.getenv("API_HASH", "").strip()
+    if not (session and api_id.isdigit() and api_hash):
+        return None
+    async with _user_lock:
+        if _user_client is not None:
+            return _user_client
+        try:
+            from telethon import TelegramClient
+            from telethon.sessions import StringSession
+
+            c = TelegramClient(StringSession(session), int(api_id), api_hash)
+            await c.connect()
+            if not await c.is_user_authorized():
+                log.warning("USER_SESSION geçersiz — bot moduna dönülüyor")
+                await c.disconnect()
+                _user_failed = True
+                return None
+            me = await c.get_me()
+            _user_client = c
+            log.info(
+                "Silme işlemleri KENDİ HESABINLA yapılacak: %s (48 saat sınırı yok)",
+                me.first_name or me.id,
+            )
+            return _user_client
+        except Exception:
+            log.exception("Kullanıcı hesabı açılamadı — bot moduna dönülüyor")
+            _user_failed = True
+            return None
+
+
+_dialogs_loaded = False
+
+
+async def _warm_dialogs(client) -> None:
+    """Sohbet listesini bir kez gezerek kanal kimliklerini önbelleğe alır.
+
+    Taze bir oturumun önbelleği boştur; bu yüzden kanal ID'sinden doğrudan
+    çözüm yapılamaz ("Could not find the input entity"). Sohbetleri bir kez
+    dolaşmak gerekli erişim anahtarlarını yerleştirir.
+    """
+    global _dialogs_loaded
+    if _dialogs_loaded:
+        return
+    try:
+        adet = 0
+        async for _ in client.iter_dialogs(limit=None):
+            adet += 1
+        log.info("Hesabın sohbet listesi önbelleğe alındı (%s sohbet)", adet)
+        _dialogs_loaded = True
+    except Exception:
+        log.exception("Sohbet listesi alınamadı")
+
+
+async def _user_entity(client, chat_id: int):
+    from telethon.tl.types import PeerChannel
+
+    s = str(chat_id)
+    internal = int(s[4:]) if s.startswith("-100") else abs(chat_id)
+
+    for deneme in (1, 2):
+        try:
+            return await client.get_input_entity(PeerChannel(internal))
+        except Exception:
+            pass
+        try:
+            return await client.get_entity(chat_id)
+        except Exception:
+            pass
+        if deneme == 1:
+            # Önbellek boş olabilir — sohbetleri gezip tekrar dene
+            await _warm_dialogs(client)
+    log.warning("Kanal kullanıcı hesabında çözülemedi (chat=%s)", chat_id)
+    return None
+
+
+async def user_sweep(chat_id: int, start: int, stop: int) -> Optional[tuple[int, int]]:
+    """Kullanıcı hesabıyla siler (yaş sınırı yok). Kullanılamıyorsa None."""
+    client = await get_user_client()
+    if client is None:
+        return None
+    entity = await _user_entity(client, chat_id)
+    if entity is None:
+        log.warning("Kanal kullanıcı hesabında bulunamadı (chat=%s)", chat_id)
+        return None
+
+    import telethon.errors as terr
+
+    silinen = 0
+    for batch in iter_batches(start, stop, USER_BATCH):
+        for deneme in range(6):
+            try:
+                sonuc = await client.delete_messages(entity, batch)
+                # GERÇEK silinen sayısını Telegram'ın döndürdüğü pts_count verir.
+                # len(batch) saymak yanlış: aralıkta zaten silinmiş ID'ler olabilir
+                # ve kullanıcıya olduğundan fazla rakam bildirilir.
+                try:
+                    silinen += sum(getattr(r, "pts_count", 0) for r in (sonuc or []))
+                except TypeError:
+                    silinen += getattr(sonuc, "pts_count", 0)
+                break
+            except terr.FloodWaitError as e:
+                bekle = min(e.seconds + 2, 300)
+                log.info("Hesap flood limiti: %s sn bekleniyor", bekle)
+                await asyncio.sleep(bekle)
+            except Exception:
+                log.exception("Grup silinemedi (%s..%s)", batch[0], batch[-1])
+                break
+        await asyncio.sleep(USER_GAP)
+    return silinen, 0
+
+
+async def _delete_one(bot: Bot, chat_id: int, mid: int) -> str:
+    """Tek mesajı siler. Dönen: 'silindi' | 'eski' | 'yok' | 'hata'."""
+    for _ in range(4):
+        try:
+            await bot.delete_message(chat_id, mid)
+            return "silindi"
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(min(float(e.retry_after) + 1.0, 120.0))
+        except TelegramBadRequest as e:
+            s = str(e)
+            if TOO_OLD in s:
+                return "eski"       # 48 saatten eski — Telegram izin vermiyor
+            return "yok"            # zaten silinmiş / geçersiz ID
+        except TelegramForbiddenError:
+            raise
+        except Exception:
+            await asyncio.sleep(2)
+    return "hata"
+
+
+async def delete_batch(bot: Bot, chat_id: int, batch: list[int]) -> tuple[int, int]:
+    """Bir 90'lık grubu siler. Dönen: (gerçekten_silinen, 48_saatten_eski).
 
     Flood limitine takılınca TEK DOĞRU HAMLE beklemektir: Telegram'ın söylediği
-    süre kadar bekleyip AYNI grubu yeniden deneriz. (Tek tek silmeye düşmek floodu
-    90 katına çıkarır — eski sürümdeki 'sadece ilk 90 siliniyor' hatasının kökü buydu.)
-    Tek tek silme yalnızca 'grupta silinemeyen mesaj var' (BadRequest) durumunda kullanılır.
+    süre kadar bekleyip AYNI grubu yeniden deneriz.
+
+    ÖNEMLİ — Telegram 48 saatten eski mesajları bota SİLDİRMİYOR ("message can't
+    be deleted"). Toplu silmede grupta tek bir eski mesaj varsa TÜM istek
+    reddediliyor. Bu yüzden reddedilen grubu tek tek eleyip gerçekten kaç tanesini
+    sildiğimizi sayıyoruz — eskiden hepsi silinmiş sayılıp kullanıcıya yanlış
+    "temizlendi" raporu veriliyordu.
     """
     if not batch:
-        return True
+        return 0, 0
     tries = 0
     while True:
         try:
             await bot.delete_messages(chat_id=chat_id, message_ids=batch)
-            return True
+            return len(batch), 0
         except TelegramRetryAfter as e:
             tries += 1
             if tries >= 8:
-                log.warning("Grup %s..%s: flood 8 kez üst üste, grup atlanıyor", batch[0], batch[-1])
-                return False
+                log.warning("Grup %s..%s: flood 8 kez üst üste, atlanıyor", batch[0], batch[-1])
+                return 0, 0
             wait = min(float(e.retry_after) + 1.0, 120.0)
             log.info("Flood limiti: %.0f sn bekleniyor (chat=%s)", wait, chat_id)
             await asyncio.sleep(wait)
         except TelegramBadRequest:
-            break  # grupta silinemeyen mesaj olabilir -> tek tek ele
+            break  # grupta silinemeyen mesaj var -> tek tek ele ve say
         except TelegramForbiddenError:
             raise
         except Exception:  # ağ kopması vb. geçici hatalar temizliği ÖLDÜRMEZ
             tries += 1
             if tries >= 8:
-                log.exception("Grup %s..%s: kalıcı ağ hatası, grup atlanıyor", batch[0], batch[-1])
-                return False
+                log.exception("Grup %s..%s: kalıcı ağ hatası, atlanıyor", batch[0], batch[-1])
+                return 0, 0
             log.warning("Geçici hata, 3 sn sonra aynı grup yeniden denenecek")
             await asyncio.sleep(3)
 
+    silinen = eski = 0
     for mid in batch:
-        for _ in range(4):
-            try:
-                await bot.delete_message(chat_id, mid)
-                break
-            except TelegramRetryAfter as e:
-                await asyncio.sleep(min(float(e.retry_after) + 1.0, 120.0))
-            except TelegramBadRequest:
-                break  # zaten yok / silinemez -> atla
-            except TelegramForbiddenError:
-                raise
-            except Exception:
-                await asyncio.sleep(2)
+        sonuc = await _delete_one(bot, chat_id, mid)
+        if sonuc == "silindi":
+            silinen += 1
+        elif sonuc == "eski":
+            eski += 1
         await asyncio.sleep(0.05)
-    return True
+    return silinen, eski
 
 
 async def sweep(bot: Bot, chat_id: int, start: int, stop: int) -> tuple[int, int]:
-    """start'tan stop'a (stop HARİÇ) tüm ID aralığını 90'ar 90'ar temizler.
+    """start'tan stop'a (stop HARİÇ) ID aralığını 90'ar 90'ar temizler.
 
-    Hiçbir grup hatası taramayı durdurmaz; (taranan_mesaj, atlanan_grup) döner.
+    Dönen: (gerçekten_silinen, 48_saatten_eski_olduğu_için_silinemeyen).
+
+    Mesajlar yeniden eskiye doğru silindiği için 48 saatlik duvara bir kez
+    çarpınca daha eskisi de silinemez — o noktada durup binlerce boş istek
+    atmıyoruz.
     """
-    total = max(0, start - stop)
-    done = 0
-    failed = 0
+    # Önce kendi hesabınla dene — 48 saat sınırı olmadığı için tercih edilen yol
+    sonuc = await user_sweep(chat_id, start, stop)
+    if sonuc is not None:
+        return sonuc
+
+    silinen = 0
+    eski = 0
+    ard_arda_eski = 0
+
     for batch in iter_batches(start, stop):
         try:
-            ok = await delete_batch(bot, chat_id, batch)
+            b_silinen, b_eski = await delete_batch(bot, chat_id, batch)
         except TelegramForbiddenError:
             raise  # kanaldan atılmışız — devam etmenin anlamı yok
         except Exception:
             log.exception("Grup beklenmedik şekilde patladı, atlanıp devam ediliyor")
-            ok = False
-        if ok:
-            done += len(batch)
-        else:
-            failed += 1
-            if failed >= 20:
-                log.warning("20 grup üst üste başarısız; tarama durduruluyor (chat=%s)", chat_id)
+            b_silinen, b_eski = 0, 0
+
+        silinen += b_silinen
+        eski += b_eski
+
+        if b_eski and not b_silinen:
+            ard_arda_eski += 1
+            if ard_arda_eski >= 2:
+                # 48 saat duvarını geçtik; geri kalanı Telegram zaten sildirmez
+                kalan = max(0, batch[-1] - stop - 1)
+                eski += kalan
+                log.info(
+                    "48 saat sınırına ulaşıldı (chat=%s). Silinen=%s, eski=%s",
+                    chat_id, silinen, eski,
+                )
                 break
-        if done < total:
-            await asyncio.sleep(BATCH_DELAY)
-    return done, failed
+        else:
+            ard_arda_eski = 0
+
+        await asyncio.sleep(BATCH_DELAY)
+
+    return silinen, eski
 
 
 # ------------------------------------------- son mesaj ID'sini SESSİZCE bulma
@@ -666,7 +854,143 @@ async def on_unban(cb: CallbackQuery, bot: Bot) -> None:
         pass
 
 
+
 # ------------------------------------------------------------------ akışlar
+
+async def _kanal_basligi(client, entity, chat_id: int) -> str:
+    try:
+        bilgi = await client.get_entity(entity)
+        return getattr(bilgi, "title", None) or str(chat_id)
+    except Exception:
+        return str(chat_id)
+
+
+async def _istekci_yonetici_mi(bot: Bot, chat_id: int, istekci_id: int) -> Optional[bool]:
+    """Linki gönderen kişi kanalda yönetici mi? Karar verilemezse None.
+
+    Bot herkese açık olduğu için bu kontrol şart: olmadan, hesabımızın ya da
+    botun yönetici olduğu bir kanalın linkini yabancı biri gönderip silme
+    başlatabilirdi.
+    """
+    try:
+        uye = await bot.get_chat_member(chat_id, istekci_id)
+        return getattr(uye, "status", "") in ("administrator", "creator")
+    except (TelegramBadRequest, TelegramForbiddenError):
+        return None
+
+
+async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple[bool, str]:
+    """Hesap yolu için güvenlik kapısı ve gerekiyorsa otomatik yetkilendirme.
+
+    İki şart birden sağlanmalı:
+      • Bağlı kullanıcı hesabı kanalda silme yapabilmeli
+      • Linki GÖNDEREN kişi de o kanalda yönetici olmalı
+
+    Hesabın yetkisi yoksa ve bot kanalda kalıcı yönetici duruyorsa, yetkiyi bot
+    otomatik verir (bkz. yedek.py). İş bitince yedek_kapat geri alır.
+
+    Dönen: (uygun_mu, başlık_veya_hata_mesajı)
+    """
+    client = await get_user_client()
+    if client is None:
+        return False, (
+            "❌ Bu kanala ulaşamıyorum. Beni kanala <b>yönetici</b> olarak ekle, "
+            "sonra linki tekrar gönder."
+        )
+
+    try:
+        ben = await client.get_me()
+    except Exception:
+        log.warning("Hesap kimliği okunamadı", exc_info=True)
+        return False, "❌ Bağlı hesaba ulaşamadım, biraz sonra tekrar dene."
+    sahibi_mi = ben is not None and istekci_id == ben.id
+
+    global _dialogs_loaded
+    _dialogs_loaded = False  # yeni verilen yetkiler görünsün
+    entity = await _user_entity(client, chat_id)
+
+    # --- Hesabın yetkisi yok: bot kalıcı yönetici ise yetkiyi o versin --------
+    if entity is None:
+        uygun, hata = await yedek.kullanilabilir_mi(bot, chat_id)
+        if not uygun:
+            return False, hata
+
+        if not sahibi_mi:
+            yetkili = await _istekci_yonetici_mi(bot, chat_id, istekci_id)
+            if yetkili is not True:
+                return False, (
+                    "⛔ Bu kanalda yönetici görünmüyorsun; güvenlik gereği "
+                    "işlemi başlatamam."
+                )
+
+        ok, hata = await yedek.yetki_ver(bot, client, chat_id, ben.id)
+        if not ok:
+            return False, hata
+
+        _dialogs_loaded = False
+        entity = await _user_entity(client, chat_id)
+        if entity is None:
+            await yedek.yetki_al(bot, chat_id, ben.id)  # yarım kalan yetkiyi bırakma
+            return False, (
+                "❌ Yetki verildi ama kanalı hâlâ göremiyorum. "
+                "Birkaç saniye sonra linki tekrar gönder."
+            )
+
+        _yedek_verdi.add(chat_id)
+        log.info("Otomatik yetkilendirme tamam: chat=%s", chat_id)
+        return True, await _kanal_basligi(client, entity, chat_id)
+
+    # --- Hesabın zaten yetkisi var -------------------------------------------
+    # İsteği yapan bağlı hesabın SAHİBİ ise ek kontrole gerek yok: kendi
+    # hesabıyla, kendi yetkisiyle siliyor. (Bazı kanallarda hesap mesaj
+    # silebiliyor ama yönetici listesini okuyamıyor.)
+    if sahibi_mi:
+        return True, await _kanal_basligi(client, entity, chat_id)
+
+    yetkili = await _istekci_yonetici_mi(bot, chat_id, istekci_id)
+
+    if yetkili is None:
+        try:
+            from telethon.tl.functions.channels import GetParticipantRequest
+            from telethon.tl.types import (
+                ChannelParticipantAdmin,
+                ChannelParticipantCreator,
+            )
+
+            res = await client(
+                GetParticipantRequest(channel=entity, participant=istekci_id)
+            )
+            yetkili = isinstance(
+                res.participant, (ChannelParticipantAdmin, ChannelParticipantCreator)
+            )
+        except Exception:
+            log.debug("Tekil yönetici sorgusu olmadı (chat=%s)", chat_id, exc_info=True)
+
+    if yetkili is None:
+        try:
+            from telethon.tl.types import ChannelParticipantsAdmins
+
+            yoneticiler = [
+                u.id
+                async for u in client.iter_participants(
+                    entity, filter=ChannelParticipantsAdmins
+                )
+            ]
+            yetkili = istekci_id in yoneticiler
+        except Exception:
+            log.warning("Yönetici listesi okunamadı (chat=%s)", chat_id)
+            return False, (
+                "⛔ Bu kanalda yönetici olduğunu doğrulayamadım; güvenlik gereği "
+                "işlemi başlatamam. Kanal sahibiysen bağlı hesabı kullan."
+            )
+
+    if not yetkili:
+        return False, (
+            "⛔ Bu kanalda yönetici görünmüyorsun; güvenlik gereği işlemi başlatamam."
+        )
+
+    return True, await _kanal_basligi(client, entity, chat_id)
+
 
 async def prepare_job(
     message: Message,
@@ -676,44 +1000,71 @@ async def prepare_job(
     show_preview: bool = True,
 ) -> None:
     user_id = message.from_user.id
+
+    # İki yol var:
+    #   1) BOT yolu   — bot kanalda yönetici. Klasik; ama 48 saat sınırı var.
+    #   2) HESAP yolu — bot kanalda YOK ama bağlı kullanıcı hesabı yönetici.
+    #                   Yaş sınırı yok. Bot herkese açık olduğu için burada
+    #                   güvenlik şart: linki GÖNDEREN kişi de o kanalda yönetici
+    #                   olmalı, yoksa yabancı biri başkasının kanalını sildirebilir.
+    chat = None
     try:
         chat = await bot.get_chat(chat_ref)
     except (TelegramBadRequest, TelegramForbiddenError):
-        await message.answer(
-            "❌ Bu kanala ulaşamıyorum. Önce beni kanala <b>yönetici</b> olarak ekle, "
-            "sonra linki tekrar gönder."
-        )
-        return
-    if chat.type not in ("channel", "supergroup", "group"):
-        await message.answer("❌ Bu bir kanal/grup mesajı linki değil.")
-        return
+        chat = None
 
-    try:
-        admins = await bot.get_chat_administrators(chat.id)
-    except (TelegramBadRequest, TelegramForbiddenError):
-        await message.answer(
-            "❌ Yönetici listesine bakamadım — kanalda yönetici olduğumdan emin ol."
-        )
-        return
+    if chat is not None:
+        if chat.type not in ("channel", "supergroup", "group"):
+            await message.answer("❌ Bu bir kanal/grup mesajı linki değil.")
+            return
+        try:
+            admins = await bot.get_chat_administrators(chat.id)
+        except (TelegramBadRequest, TelegramForbiddenError):
+            admins = []
+        me_admin = next((a for a in admins if a.user.id == bot.id), None)
+        istekci_admin = next((a for a in admins if a.user.id == user_id), None)
+        bot_silebilir = bool(me_admin and getattr(me_admin, "can_delete_messages", False))
 
-    me_admin = next((a for a in admins if a.user.id == bot.id), None)
-    if me_admin is None or not getattr(me_admin, "can_delete_messages", False):
-        await message.answer(
-            "❌ Bende <b>Mesajları sil</b> yetkisi yok.\n"
-            "Kanal → Yöneticiler → bot → <i>Mesajları sil</i> iznini aç, tekrar dene."
-        )
-        return
-    if next((a for a in admins if a.user.id == user_id), None) is None:
-        await message.answer(
-            "⛔ Bu kanalda yönetici görünmüyorsun; güvenlik gereği işlemi başlatamam."
-        )
-        return
+        # Hesap yolu ÖNCE denenir: botun 48 saat sınırı var, hesabın yok.
+        # Bot kanalda yönetici olsa bile hesapla silmek her zaman daha iyi.
+        ok, baslik = False, ""
+        if os.getenv("USER_SESSION", "").strip():
+            ok, baslik = await _hesap_yetki_kontrol(bot, chat.id, user_id)
+            if ok:
+                chat_id, kullanici_adi = chat.id, chat.username
+
+        if not ok:
+            if not bot_silebilir:
+                await message.answer(baslik if baslik else (
+                    "❌ Bu kanalda silme yetkim yok. Beni <b>yönetici</b> yap ve "
+                    "<i>Mesajları sil</i> yetkisini ver."
+                ))
+                return
+            if istekci_admin is None:
+                await message.answer(
+                    "⛔ Bu kanalda yönetici görünmüyorsun; güvenlik gereği işlemi başlatamam."
+                )
+                return
+            chat_id, baslik, kullanici_adi = chat.id, chat.title, chat.username
+    else:
+        # Bot kanalda hiç yok — yalnızca hesap yolu denenebilir
+        if not isinstance(chat_ref, int):
+            await message.answer(
+                "❌ Bu kanala ulaşamıyorum. Beni kanala <b>yönetici</b> olarak ekle "
+                "ya da bağlı hesabı yönetici yap."
+            )
+            return
+        ok, baslik = await _hesap_yetki_kontrol(bot, chat_ref, user_id)
+        if not ok:
+            await message.answer(baslik)
+            return
+        chat_id, kullanici_adi = chat_ref, None
 
     note = ""
-    if show_preview:
+    if show_preview and chat is not None:
         try:
             await bot.forward_message(
-                user_id, chat.id, anchor_id, disable_notification=True
+                user_id, chat_id, anchor_id, disable_notification=True
             )
             note = "⬆️ Ana mesaj bu — burada duracağım.\n\n"
         except TelegramBadRequest as e:
@@ -724,18 +1075,27 @@ async def prepare_job(
                 )
 
     job = {
-        "chat_id": chat.id,
+        "chat_id": chat_id,
         "anchor_id": anchor_id,
-        "title": chat.title or str(chat.id),
-        "username": chat.username,  # sessiz MTProto taraması için (özel kanalda None)
+        "title": baslik or str(chat_id),
+        "username": kullanici_adi,  # sessiz MTProto taraması için (özel kanalda None)
     }
     pending[user_id] = job
     await save_last_job(user_id, job)
 
+    # Hangi yolla silineceğini kullanıcıya baştan söyle
+    hesap_var = await get_user_client() is not None
+    yol = (
+        "🔓 Hesap modu — yaş sınırı yok, eski mesajlar da silinir."
+        if hesap_var
+        else "🤖 Bot modu — Telegram kuralı gereği yalnızca 48 saatten yeni mesajlar silinebilir."
+    )
+
     await message.answer(
         f"{note}"
         f"📋 Kanal: <b>{html.escape(job['title'])}</b>\n"
-        f"🎯 Ana mesaj ID: <code>{anchor_id}</code>\n\n"
+        f"🎯 Ana mesaj ID: <code>{anchor_id}</code>\n"
+        f"{yol}\n\n"
         "Hangi yönde sileyim? (Ana mesajın kendisi <b>silinmez</b>)",
         reply_markup=confirm_kb(),
     )
@@ -807,8 +1167,26 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
         await cb.answer("Bu kanalda temizlik zaten sürüyor, bitmesini bekle.", show_alert=True)
         return
 
+    # Servis kapalıyken basılmış ESKİ butonlar, bot geri gelince Telegram
+    # tarafından tekrar oynatılıyor. Böyle bir tıklamayla silme BAŞLATILMAMALI.
+    if BOOT_TS and cb.message and cb.message.date:
+        if cb.message.date.timestamp() < BOOT_TS - 60:
+            try:
+                await cb.answer(
+                    "Bu buton eski bir oturumdan kalma. Linki tekrar gönder.",
+                    show_alert=True,
+                )
+            except TelegramBadRequest:
+                pass
+            return
+
     # Ekstra mesaj yok: küçük bir bildirim baloncuğu gösterip sessizce işe başla
-    await cb.answer("🧹 Başladım, bitince haber veririm")
+    try:
+        await cb.answer("🧹 Başladım, bitince haber veririm")
+    except TelegramBadRequest:
+        # "query is too old" — tıklama zaman aşımına uğramış; işe başlamıyoruz
+        log.info("Eski buton tıklaması yok sayıldı (chat=%s)", chat_id)
+        return
     try:
         await cb.message.edit_reply_markup(reply_markup=None)
     except TelegramBadRequest:
@@ -817,28 +1195,48 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
     active_chats.add(chat_id)
     try:
         if action == "after":
-            deleted, failed = await clean_after(
+            deleted, too_old = await clean_after(
                 bot, chat_id, anchor_id, job.get("username")
             )
         else:
-            deleted, failed = await clean_before(bot, chat_id, anchor_id)
-        if deleted <= 0 and failed == 0:
+            deleted, too_old = await clean_before(bot, chat_id, anchor_id)
+
+        if deleted <= 0 and too_old <= 0:
             text = "✅ Silinecek mesaj yoktu; orası zaten temiz."
+        elif deleted <= 0:
+            text = (
+                "⚠️ <b>Hiçbir mesaj silinemedi.</b>\n\n"
+                f"Bu aralıktaki mesajların hepsi <b>48 saatten eski</b>. "
+                "Telegram, botların 48 saatten eski mesajları silmesine izin vermiyor — "
+                "bu bir yetki sorunu değil, Telegram'ın kuralı.\n\n"
+                "Eski mesajlar için: kanalda mesajlara uzun bas → seç → sil, "
+                "ya da kanal ayarlarından geçmişi temizle."
+            )
         else:
             text = (
-                f"✅ Bitti! ~<b>{deleted}</b> mesajlık aralık temizlendi.\n"
+                f"✅ Bitti! <b>{deleted}</b> mesaj silindi.\n"
                 f"🎯 Ana mesaj (<code>{anchor_id}</code>) yerinde duruyor."
             )
-            if failed:
+            if too_old:
                 text += (
-                    f"\n⚠️ {failed} grup Telegram limitleri yüzünden atlandı — "
-                    "aynı linki gönderip bir daha başlatırsan kalanları da temizlerim."
+                    f"\n\n⚠️ <b>{too_old}</b> mesaj silinemedi çünkü <b>48 saatten eski</b>. "
+                    "Telegram botların bu kadar eski mesajları silmesine izin vermiyor."
                 )
+                hesap = os.getenv("USER_SESSION", "").strip()
+                if hesap:
+                    text += (
+                        "\n\n💡 Bunu aşmanın yolu var: bağlı <b>kullanıcı hesabını</b> bu kanalda "
+                        "<b>yönetici</b> yapın ve <i>Mesajları sil</i> yetkisini verin. "
+                        "O zaman eski mesajlar da silinebilir — kullanıcı hesaplarında "
+                        "48 saat sınırı yok."
+                    )
         try:
             await bot.send_message(cb.from_user.id, text)
         except Exception:  # rapor gönderilemese de temizlik tamamlanmıştır
             log.warning("Sonuç mesajı gönderilemedi (user=%s)", cb.from_user.id)
-        log.info("Temizlik bitti: chat=%s taranan=%s atlanan_grup=%s", chat_id, deleted, failed)
+        log.info(
+            "Temizlik bitti: chat=%s SILINEN=%s eski(48s+)=%s", chat_id, deleted, too_old
+        )
     except TelegramForbiddenError:
         try:
             await bot.send_message(
@@ -859,6 +1257,12 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
             pass
     finally:
         active_chats.discard(chat_id)
+        kapanis = await yedek_kapat(bot, chat_id)
+        if kapanis:
+            try:
+                await bot.send_message(cb.from_user.id, kapanis.strip())
+            except Exception:
+                log.debug("Kapanış bilgisi gönderilemedi", exc_info=True)
 
 
 @dp.message(F.chat.type == "private")
@@ -927,6 +1331,31 @@ async def _self_ping_loop() -> None:
                 await s.get(url, timeout=aiohttp.ClientTimeout(total=20))
         except Exception:  # noqa: BLE001 — ping başarısızsa sonraki turda dener
             pass
+
+
+async def run_polling() -> None:
+    """Botu MEVCUT event loop içinde çalıştırır (kendi sunucusunu açmaz).
+
+    Honeypot Radar ile aynı süreçte yaşayabilmesi için var: iki ayrı servis
+    ücretsiz barındırma kotasını ikiye katlıyordu (ayda 730 saat yerine 1460).
+    Tek süreçte birleşince tek servis kotasına sığıyor.
+
+    BOT_TOKEN tanımlı değilse sessizce hiçbir şey yapmaz.
+    """
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token:
+        log.info("BOT_TOKEN yok — kanal temizlik botu devre dışı")
+        return
+
+    global BOOT_TS
+    BOOT_TS = time.time()
+    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    await bot.delete_webhook()
+    me = await bot.get_me()
+    log.info("Kanal temizlik botu başladı: @%s", me.username)
+    await dp.start_polling(
+        bot, allowed_updates=["message", "channel_post", "callback_query"]
+    )
 
 
 async def main() -> None:
