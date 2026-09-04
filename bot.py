@@ -83,6 +83,52 @@ _seen_lock = asyncio.Lock()        # son_gorulen.json yazma koruması
 KICK_REQUEST_ID = 1001  # kişi seçme butonunun kimliği
 BOOT_TS = 0.0           # bot açılış zamanı; birikmiş eski özel mesajları elemek için
 
+IZIN_FILE = Path(__file__).with_name("izinliler.json")
+_izin_lock = asyncio.Lock()
+_hesap_sahibi_id: Optional[int] = None   # USER_SESSION'ın sahibi; ilk kullanımda dolar
+
+
+def _izinlileri_oku() -> set[int]:
+    """Otomatik yetkilendirmeyi tetikleyebilecek kişiler.
+
+    Bot HERKESE AÇIK. Otomatik mod olmasaydı hesabın bir kanala girmesi için bir
+    insanın elle yetki vermesi gerekirdi; o adım doğal bir kapıydı. Otomatik modda
+    o kapı yok — bu liste onun yerini alır. Listede olmayan biri, kendi kanalının
+    yöneticisi bile olsa, hesabı kanalına otomatik çektiremez.
+    """
+    try:
+        return {int(x) for x in json.loads(IZIN_FILE.read_text(encoding="utf-8"))}
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return set()
+
+
+async def _izinlileri_yaz(kisiler: set[int]) -> None:
+    async with _izin_lock:
+        try:
+            IZIN_FILE.write_text(json.dumps(sorted(kisiler)), encoding="utf-8")
+        except OSError:
+            log.warning("izinliler.json yazılamadı")
+
+
+async def hesap_sahibi_id() -> Optional[int]:
+    """Bağlı kullanıcı hesabının sahibi — her zaman izinlidir."""
+    global _hesap_sahibi_id
+    if _hesap_sahibi_id is not None:
+        return _hesap_sahibi_id
+    client = await get_user_client()
+    if client is None:
+        return None
+    try:
+        _hesap_sahibi_id = (await client.get_me()).id
+    except Exception:
+        log.debug("Hesap sahibi okunamadı", exc_info=True)
+    return _hesap_sahibi_id
+
+
+async def otomatik_izinli_mi(kisi_id: int) -> bool:
+    return kisi_id == await hesap_sahibi_id() or kisi_id in _izinlileri_oku()
+
+
 # Yetkisi YEDEK hesap tarafından otomatik verilmiş kanallar. İş biter bitmez
 # yetki geri alınır ve kanaldan çıkılır — kalıcı yetki bırakılmaz.
 _yedek_verdi: set[int] = set()
@@ -128,6 +174,7 @@ START_TEXT = (
     "<b>Komutlar:</b>\n"
     "/tekrar — son işi aynı ana mesajla yeniden başlat\n"
     "/kanaldanat — kanaldan kişi at (örn: <code>/kanaldanat @kullanici</code>)\n\n"
+    "<i>Bot sahibine özel:</i> /izinver, /izinal, /izinliler\n\n"
     "ℹ️ <b>Neden üç yetki?</b> Telegram botların 48 saatten eski mesajları "
     "silmesine izin vermiyor. Bu sınır kullanıcı hesaplarında yok. O yüzden iş "
     "geldiğinde bağlı hesabı kanala kendim alıp silme yetkisi veriyorum, iş "
@@ -916,6 +963,17 @@ async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple
             return False, hata
 
         if not sahibi_mi:
+            # İKİ ŞART birden: hem bu kanalın yöneticisi olacak, hem de otomatik
+            # moda izinli listesinde olacak. İkincisi olmadan, botu kendi kanalına
+            # ekleyen herhangi bir yabancı hesabı içeri çektirebilirdi.
+            if not await otomatik_izinli_mi(istekci_id):
+                return False, (
+                    "⛔ Otomatik mod için izinli değilsin.\n\n"
+                    "Bot sahibinin seni izinli listesine eklemesi gerekiyor. "
+                    f"Ona bu numarayı ilet: <code>{istekci_id}</code>\n\n"
+                    "Alternatif: bağlı hesabı kanalda elle <b>yönetici</b> yapıp "
+                    "<i>Mesajları sil</i> yetkisi ver — o zaman izin gerekmez."
+                )
             yetkili = await _istekci_yonetici_mi(bot, chat_id, istekci_id)
             if yetkili is not True:
                 return False, (
@@ -1103,7 +1161,79 @@ async def prepare_job(
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
-    await message.answer(START_TEXT)
+    metin = START_TEXT
+    # Otomatik mod izne bağlı; kişi onay için numarasını aramasın diye burada gösteriyoruz.
+    if not await otomatik_izinli_mi(message.from_user.id):
+        metin += (
+            f"\n\n🆔 Senin numaran: <code>{message.from_user.id}</code>\n"
+            "Otomatik modu kullanacaksan bu numarayı bot sahibine gönder."
+        )
+    await message.answer(metin)
+
+
+@dp.message(Command("izinver", "izinal", "izinliler"))
+async def on_izin(message: Message) -> None:
+    """Otomatik moda kimin erişebileceğini yönetir — YALNIZCA hesap sahibi.
+
+    Bot herkese açık olduğu için otomatik yetkilendirme davete bağlı: hesabı
+    kanalına çektirebilecek kişileri sahibi tek tek onaylar.
+    """
+    sahip = await hesap_sahibi_id()
+    if sahip is None:
+        await message.answer(
+            "❌ Bağlı hesap yok; otomatik mod zaten kapalı. "
+            "(<code>USER_SESSION</code> tanımlı değil.)"
+        )
+        return
+    if message.from_user.id != sahip:
+        await message.answer("⛔ Bu komut yalnızca bot sahibine açık.")
+        return
+
+    parcalar = (message.text or "").split()
+    komut = parcalar[0].lstrip("/").split("@")[0]
+    izinliler = _izinlileri_oku()
+
+    if komut == "izinliler":
+        if not izinliler:
+            await message.answer(
+                "📋 İzinli kimse yok — otomatik modu şu an yalnızca sen kullanabilirsin.\n\n"
+                "Eklemek için: <code>/izinver 123456789</code>"
+            )
+            return
+        satirlar = "\n".join(f"• <code>{k}</code>" for k in sorted(izinliler))
+        await message.answer(f"📋 <b>Otomatik moda izinli kişiler</b>\n{satirlar}")
+        return
+
+    if len(parcalar) < 2 or not parcalar[1].lstrip("-").isdigit():
+        await message.answer(
+            f"Kullanım: <code>/{komut} 123456789</code>\n\n"
+            "Numarayı arkadaşın öğrenebilir: bota <code>/start</code> yazıp "
+            "reddedilirse bot numarasını kendisi söyler. "
+            "Ya da @userinfobot'a yazsın."
+        )
+        return
+
+    hedef = int(parcalar[1])
+    if komut == "izinver":
+        if hedef in izinliler:
+            await message.answer(f"ℹ️ <code>{hedef}</code> zaten izinli.")
+            return
+        izinliler.add(hedef)
+        await _izinlileri_yaz(izinliler)
+        log.info("Otomatik moda izin verildi: %s", hedef)
+        await message.answer(
+            f"✅ <code>{hedef}</code> artık otomatik modu kullanabilir.\n\n"
+            "Kendi <b>yönetici olduğu</b> kanallarda, bot o kanalda yönetici olmak "
+            "şartıyla temizlik başlatabilir."
+        )
+    else:
+        if hedef not in izinliler:
+            await message.answer(f"ℹ️ <code>{hedef}</code> zaten izinli değil.")
+            return
+        izinliler.discard(hedef)
+        await _izinlileri_yaz(izinliler)
+        log.info("Otomatik mod izni kaldırıldı: %s", hedef)
+        await message.answer(f"🚫 <code>{hedef}</code> için otomatik mod kapatıldı.")
 
 
 @dp.message(Command("tekrar"))
