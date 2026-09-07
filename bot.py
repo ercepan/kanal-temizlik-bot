@@ -141,14 +141,16 @@ async def otomatik_izinli_mi(kisi_id: int) -> bool:
 
 # Yetkisi YEDEK hesap tarafından otomatik verilmiş kanallar. İş biter bitmez
 # yetki geri alınır ve kanaldan çıkılır — kalıcı yetki bırakılmaz.
-_yedek_verdi: set[int] = set()
+# chat_id -> bu iş için kanala BİZ mi katıldık? (sadece o zaman çıkarız;
+# zaten üyeysek üyeliği bozmayız, grupta ayrılmak iz bırakır)
+_yedek_verdi: dict[int, bool] = {}
 
 
 async def yedek_kapat(bot: Bot, chat_id: int) -> str:
     """Otomatik verilen yetkiyi geri alır ve kanaldan çıkar. Rapor satırı döner."""
     if chat_id not in _yedek_verdi:
         return ""
-    _yedek_verdi.discard(chat_id)
+    biz_katildik = _yedek_verdi.pop(chat_id, False)
 
     client = await get_user_client()
     ben_id = None
@@ -159,13 +161,18 @@ async def yedek_kapat(bot: Bot, chat_id: int) -> str:
             log.debug("Hesap kimliği okunamadı", exc_info=True)
 
     alindi = await yedek.yetki_al(bot, chat_id, ben_id) if ben_id else False
-    cikildi = await yedek.kanaldan_cik(client, chat_id) if client else False
 
-    if alindi and cikildi:
+    # Çıkış YALNIZCA bu iş için katıldıysak. Zaten üyeysek kalırız: üyeliği
+    # bozmanın faydası yok, üstelik grupta ayrılmak servis mesajı bastırabilir.
+    cikildi = False
+    if biz_katildik and client is not None:
+        cikildi = await yedek.kanaldan_cik(client, chat_id)
+
+    if not alindi:
+        return "⚠️ Yetkiyi geri alamadım — kanaldan elle kaldırman gerekebilir."
+    if cikildi:
         return "🔒 Yetkim geri alındı, kanaldan çıktım."
-    if alindi:
-        return "🔒 Yetkim geri alındı (kanaldan çıkamadım)."
-    return "⚠️ Yetkiyi geri alamadım — kanaldan elle kaldırman gerekebilir."
+    return "🔒 Yetkim geri alındı."
 
 
 START_TEXT = (
@@ -990,9 +997,10 @@ async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple
                     "işlemi başlatamam."
                 )
 
-        ok, hata = await yedek.yetki_ver(bot, client, chat_id, ben.id)
+        ok, bilgi = await yedek.yetki_ver(bot, client, chat_id, ben.id)
         if not ok:
-            return False, hata
+            return False, bilgi
+        biz_katildik = bilgi == "KATILDIK"
 
         _dialogs_loaded = False
         entity = await _user_entity(client, chat_id)
@@ -1003,7 +1011,7 @@ async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple
                 "Birkaç saniye sonra linki tekrar gönder."
             )
 
-        _yedek_verdi.add(chat_id)
+        _yedek_verdi[chat_id] = biz_katildik
         log.info("Otomatik yetkilendirme tamam: chat=%s", chat_id)
         return True, await _kanal_basligi(client, entity, chat_id)
 
