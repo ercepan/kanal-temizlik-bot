@@ -70,7 +70,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("kanal-temizlik")
 
-from . import yedek
+# Bu dosya iki şekilde çalışır: paket modülü olarak (app/temizlik.py, radar ile
+# birlikte) ve tek başına betik olarak (kanal-temizlik-bot deposundaki bot.py).
+# Göreceli import ikinci durumda patlar, o yüzden iki yol da destekleniyor.
+try:
+    from . import yedek
+except ImportError:  # tek dosya olarak çalıştırıldı — yedek.py yanında duruyor
+    import yedek
 
 dp = Dispatcher()
 
