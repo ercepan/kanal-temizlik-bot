@@ -745,29 +745,112 @@ async def find_latest_id(bot: Bot, chat_id: int, anchor_id: int, username: Optio
     return latest
 
 
+# Silme sonrası doğrulamada tek seferde bakılacak ID sayısı ve azami çağrı.
+# Dar tutuluyor: get_messages flood limitine çabuk takılıyor (ölçüldü: art arda
+# sorgularda 30 sn bekletme). Amaç tam sayım değil, "gerçekten gitti mi" cevabı.
+DOGRULAMA_PENCERE = 200
+DOGRULAMA_CAGRI = 5
+
+
+async def kalan_var_mi(chat_id: int, alt: int, ust: int) -> Optional[bool]:
+    """(alt, ust] aralığında HÂLÂ mesaj duruyor mu?
+
+    True  = mesaj var (silme tutmamış)
+    False = aralık boş
+    None  = bakılamadı (hesap yok / kanala erişilemiyor)
+
+    Silme yukarıdan aşağı gittiği için en YENİ uçtan taranıyor: silme hiç
+    tutmadıysa ilk pencerede anlaşılır, tek çağrı yeter.
+    """
+    client = await get_user_client()
+    if client is None:
+        return None
+    entity = await _user_entity(client, chat_id)
+    if entity is None:
+        return None
+
+    tepe = ust
+    for _ in range(DOGRULAMA_CAGRI):
+        if tepe <= alt:
+            return False  # aralığın tamamına bakıldı, hiçbir şey yok
+        taban = max(alt, tepe - DOGRULAMA_PENCERE)
+        ids = list(range(taban + 1, tepe + 1))
+        try:
+            parca = await client.get_messages(entity, ids=ids)
+        except Exception:
+            log.debug("Doğrulama sorgusu yapılamadı (chat=%s)", chat_id, exc_info=True)
+            return None
+        if any(m for m in parca):
+            return True
+        tepe = taban
+        await asyncio.sleep(0.3)
+
+    # Çağrı sınırına geldik ve baktığımız yerde bir şey yoktu; alt tarafı
+    # bilmiyoruz. "Boş" DEMİYORUZ — bilmiyoruz.
+    return None if tepe > alt else False
+
+
 async def clean_after(
     bot: Bot, chat_id: int, anchor_id: int, username: Optional[str] = None
-) -> tuple[int, int]:
-    """Ana mesajdan SONRAKİ (daha yeni) her şeyi siler; (taranan, atlanan_grup) döner.
+) -> tuple[int, int, int]:
+    """Ana mesajdan SONRAKİ her şeyi siler. Dönen: (silinen, eski_48s, kalan).
 
-    Tarama bir turda sınıra takılabilir (yedek reaksiyon taraması sınırlı) ya da
-    temizlik sürerken kanala yeni mesaj düşebilir. Bu yüzden yeni bir şey
-    bulunamayana kadar tur tekrarlanır — tek komutla iş gerçekten biter.
+    Tur tekrarı iki sebepten var:
+      1) Temizlik sürerken kanala yeni mesaj düşebilir.
+      2) ÖLÇÜLEN DAVRANIŞ: Telegram, bir kanaldaki İLK silme çağrısını sessizce
+         yutabiliyor — istek başarılı döner ama hiçbir şey silinmez (aynı
+         aralıkta ikinci deneme çalışır). Bu yüzden silmenin ardından aralık
+         DOĞRULANIYOR; boşalmadıysa bekleyip yeniden deniyoruz. Böylece hem iş
+         gerçekten bitiyor hem de "sildim" derken yalan söylemiyoruz.
     """
     total_done = 0
     total_failed = 0
     ceiling = anchor_id
-    for _ in range(12):
+    bos_tur = 0            # üst üste hiçbir şey silinemeyen tur sayısı
+
+    for tur in range(12):
         latest = await find_latest_id(bot, chat_id, ceiling, username)
         if latest <= ceiling:
             break
+
         done, failed = await sweep(bot, chat_id, start=latest, stop=ceiling)
         total_done += done
         total_failed += failed
-        ceiling = latest  # bir sonraki tur yalnızca bunun ÜSTÜNE bakar
+
         if failed:
-            break  # limitlere takıldık; kullanıcıya bildirilecek
-    return total_done, total_failed
+            # 48 saat sınırı gibi gerçek bir engel; tekrar denemek düzeltmez.
+            ceiling = latest
+            break
+
+        kalan = await kalan_var_mi(chat_id, ceiling, latest)
+
+        if kalan is False:
+            ceiling = latest          # aralık gerçekten boşaldı, üstüne bak
+            bos_tur = 0
+            continue
+
+        if kalan is None:
+            # Doğrulayamadık. Silme rakamına güvenip normal akışa devam.
+            ceiling = latest
+            if done == 0:
+                bos_tur += 1
+                if bos_tur >= 2:
+                    break
+            continue
+
+        # kalan is True — mesajlar duruyor, silme tutmamış.
+        bos_tur += 1
+        if bos_tur >= 4:
+            break                      # ısrar etmenin anlamı yok, dürüstçe bildir
+        # ceiling'i İLERLETMİYORUZ: aynı aralığı yeniden deneyeceğiz.
+        await asyncio.sleep(2.0 * bos_tur)   # artan bekleme
+
+    # Son durum: ana mesajın üstünde gerçekten ne kaldı?
+    son = await find_latest_id(bot, chat_id, anchor_id, username)
+    kalan_son = await kalan_var_mi(chat_id, anchor_id, son)
+    kalan_sayi = 1 if kalan_son is True else 0   # "var/yok" bilgisi; tam sayım değil
+
+    return total_done, total_failed, kalan_sayi
 
 
 async def clean_before(bot: Bot, chat_id: int, anchor_id: int) -> tuple[int, int]:
@@ -1019,6 +1102,38 @@ async def _istekci_yonetici_mi(bot: Bot, chat_id: int, istekci_id: int) -> Optio
         return None
 
 
+async def hesap_silebiliyor_mu(client, entity) -> Optional[bool]:
+    """Bağlı hesap bu kanalda GERÇEKTEN mesaj silebiliyor mu?
+
+    Bu ayrım pahalı bir hatanın dersi: kanalı "çözebilmek" ile o kanalda
+    "silebilmek" aynı şey DEĞİL. Hesap sıradan üye olduğunda da
+    get_entity çalışıyor (ChannelParticipantSelf) ve kod yetkisi varmış gibi
+    davranıp otomatik yetkilendirmeyi atlıyordu; silme çağrısı da Telegram
+    tarafından sessizce yutuluyor, kullanıcıya "0 silindi" dönüyordu.
+
+    True  = silebilir (kurucu ya da delete_messages yetkili yönetici)
+    False = silemez (üye, ya da silme yetkisi olmayan yönetici)
+    None  = kanalda değil / bakılamadı
+    """
+    try:
+        from telethon.tl.functions.channels import GetParticipantRequest
+        from telethon.tl.types import (
+            ChannelParticipantAdmin,
+            ChannelParticipantCreator,
+        )
+
+        res = await client(GetParticipantRequest(channel=entity, participant="me"))
+        katilimci = res.participant
+        if isinstance(katilimci, ChannelParticipantCreator):
+            return True
+        if isinstance(katilimci, ChannelParticipantAdmin):
+            return bool(getattr(katilimci.admin_rights, "delete_messages", False))
+        return False          # ChannelParticipantSelf vb. — sıradan üye
+    except Exception:
+        log.debug("Hesabın kanaldaki durumu okunamadı", exc_info=True)
+        return None
+
+
 async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple[bool, str]:
     """Hesap yolu için güvenlik kapısı ve gerekiyorsa otomatik yetkilendirme.
 
@@ -1049,8 +1164,17 @@ async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple
     _dialogs_loaded = False  # yeni verilen yetkiler görünsün
     entity = await _user_entity(client, chat_id)
 
-    # --- Hesabın yetkisi yok: bot kalıcı yönetici ise yetkiyi o versin --------
-    if entity is None:
+    # Kanalı çözebilmek yetki anlamına GELMİYOR. Hesap sıradan üye olabilir;
+    # o durumda silme çağrısı sessizce boşa gider. Bu yüzden açıkça soruyoruz.
+    silebilir = await hesap_silebiliyor_mu(client, entity) if entity is not None else None
+    if entity is not None and silebilir is False:
+        log.info(
+            "Hesap kanalda ama silme yetkisi YOK (chat=%s) — otomatik yetkilendirmeye gidiliyor",
+            chat_id,
+        )
+
+    # --- Hesap silemiyor: bot kalıcı yönetici ise yetkiyi o versin ------------
+    if entity is None or silebilir is False:
         uygun, hata = await yedek.kullanilabilir_mi(bot, chat_id)
         if not uygun:
             return False, hata
@@ -1081,11 +1205,14 @@ async def _hesap_yetki_kontrol(bot: Bot, chat_id: int, istekci_id: int) -> tuple
 
         _dialogs_loaded = False
         entity = await _user_entity(client, chat_id)
-        if entity is None:
+        # Sadece "görebiliyor muyum" değil, "silebiliyor muyum" diye soruyoruz.
+        if entity is None or await hesap_silebiliyor_mu(client, entity) is not True:
             await yedek.yetki_al(bot, chat_id, ben.id)  # yarım kalan yetkiyi bırakma
             return False, (
-                "❌ Yetki verildi ama kanalı hâlâ göremiyorum. "
-                "Birkaç saniye sonra linki tekrar gönder."
+                "❌ Yetki verdim ama hesabıma silme hakkı geçmedi.\n\n"
+                "Botun kanalda <b>Mesajları sil</b> yetkisi açık olmalı — "
+                "Telegram, botun kendinde olmayan bir yetkiyi başkasına "
+                "vermesine izin vermiyor."
             )
 
         _yedek_verdi[chat_id] = biz_katildik
@@ -1427,14 +1554,30 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
 
     active_chats.add(chat_id)
     try:
+        kalan = 0
         if action == "after":
-            deleted, too_old = await clean_after(
+            deleted, too_old, kalan = await clean_after(
                 bot, chat_id, anchor_id, job.get("username")
             )
         else:
             deleted, too_old = await clean_before(bot, chat_id, anchor_id)
 
-        if deleted <= 0 and too_old <= 0:
+        if kalan and deleted <= 0:
+            # Mesajlar duruyor ve hiçbiri silinemedi. "Temiz" DEMİYORUZ.
+            text = (
+                "⚠️ <b>Silemedim</b> — mesajlar hâlâ duruyor.\n\n"
+                "Telegram silme isteğini kabul etti ama uygulamadı. En sık sebebi "
+                "yetkinin daha yeni verilmiş olması; birkaç saniye içinde oturuyor.\n\n"
+                "🔄 Aynı linki tekrar gönder, bu kez çalışacaktır."
+            )
+        elif kalan:
+            # Bir kısmı silindi ama hepsi değil.
+            text = (
+                f"⚠️ <b>{deleted}</b> mesaj silindi ama <b>hepsi değil</b> — "
+                "ana mesajın üstünde hâlâ mesaj var.\n\n"
+                "🔄 Aynı linki tekrar gönder, kaldığı yerden devam eder."
+            )
+        elif deleted <= 0 and too_old <= 0:
             text = "✅ Silinecek mesaj yoktu; orası zaten temiz."
         elif deleted <= 0:
             text = (
@@ -1448,7 +1591,8 @@ async def on_clean_button(cb: CallbackQuery, bot: Bot) -> None:
         else:
             text = (
                 f"✅ Bitti! <b>{deleted}</b> mesaj silindi.\n"
-                f"🎯 Ana mesaj (<code>{anchor_id}</code>) yerinde duruyor."
+                f"🎯 Ana mesaj (<code>{anchor_id}</code>) yerinde duruyor.\n"
+                f"🔎 Kontrol ettim: üstünde mesaj kalmadı."
             )
             if too_old:
                 text += (

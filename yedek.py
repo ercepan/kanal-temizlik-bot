@@ -46,8 +46,10 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 
 log = logging.getLogger("kanal-temizlik.yetki")
 
-# Yükseltmenin MTProto tarafında görünmesi için beklenecek süre
-YETKI_YERLESME = 3.0
+# Yükseltmenin MTProto tarafında görünmesi için beklenecek süre.
+# 3 sn denendi, yetmedi: yetki verildikten hemen sonraki ilk silme çağrısı
+# sessizce yutuluyordu (istek başarılı döner, hiçbir şey silinmez).
+YETKI_YERLESME = 8.0
 
 # Davet linki: t.me/+HASH  ya da  t.me/joinchat/HASH
 _DAVET_RE = re.compile(r"(?:t\.me/(?:joinchat/|\+))([A-Za-z0-9_-]+)")
