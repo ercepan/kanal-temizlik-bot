@@ -344,6 +344,26 @@ async def get_user_client():
     api_hash = os.getenv("API_HASH", "").strip()
     if not (session and api_id.isdigit() and api_hash):
         return None
+
+    # ÇİFT BAĞLANTI KORUMASI — pahalı bir dersin sonucu.
+    #
+    # Telegram, aynı oturum anahtarının iki farklı IP'den EŞZAMANLI kullanılmasını
+    # güvenlik ihlali sayıp anahtarı KALICI OLARAK iptal eder
+    # (AuthKeyDuplicatedError). Bu bir kez başımıza geldi: bot Render'da
+    # çalışırken aynı .env ile yerelde bir betik çalıştırıldı ve oturum öldü;
+    # yeniden telefon doğrulamasıyla açmak gerekti.
+    #
+    # Oturum sunucuda yaşıyorsa yerelde AÇMIYORUZ. Gerçekten gerekiyorsa
+    # (önce sunucuyu durdurup) YEREL_OTURUM=1 ile bilerek açılır.
+    if not os.getenv("RENDER") and os.getenv("YEREL_OTURUM", "").strip() != "1":
+        log.warning(
+            "Hesap oturumu yerelde AÇILMADI. Aynı anahtar iki yerde kullanılırsa "
+            "Telegram onu kalıcı olarak iptal eder. Gerçekten gerekiyorsa önce "
+            "sunucudaki servisi durdur, sonra YEREL_OTURUM=1 ile çalıştır."
+        )
+        _user_failed = True
+        return None
+
     async with _user_lock:
         if _user_client is not None:
             return _user_client
