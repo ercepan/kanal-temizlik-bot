@@ -76,6 +76,9 @@ log = logging.getLogger("kanal-temizlik")
 try:
     from . import yedek
 except ImportError:  # tek dosya olarak çalıştırıldı — yedek.py yanında duruyor
+    # Kendi dizinini yola ekliyoruz: "python bot.py" bunu kendiliğinden yapar
+    # ama başka bir dizinden içe aktarıldığında yapmaz.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import yedek
 
 dp = Dispatcher()
@@ -179,6 +182,31 @@ async def yedek_kapat(bot: Bot, chat_id: int) -> str:
     if cikildi:
         return "🔒 Yetkim geri alındı, kanaldan çıktım."
     return "🔒 Yetkim geri alındı."
+
+
+def _load_seen() -> dict[int, int]:
+    try:
+        raw = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        return {int(k): int(v) for k, v in raw.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+# kanal -> bilinen son mesaj ID'si (kanal postlarından takip edilir)
+last_seen: dict[int, int] = _load_seen()
+
+
+async def remember_seen(chat_id: int, message_id: int) -> None:
+    if message_id <= last_seen.get(chat_id, 0):
+        return
+    last_seen[chat_id] = message_id
+    async with _seen_lock:
+        try:
+            SEEN_FILE.write_text(
+                json.dumps({str(k): v for k, v in last_seen.items()}), encoding="utf-8"
+            )
+        except OSError:
+            pass
 
 
 START_TEXT = (
@@ -660,6 +688,29 @@ async def _reaction_find_latest(bot: Bot, chat_id: int, floor: int) -> int:
 async def find_latest_id(bot: Bot, chat_id: int, anchor_id: int, username: Optional[str] = None) -> int:
     """Kanaldaki son mesaj ID'sini kanala hiçbir şey atmadan bulur."""
     floor = max(last_seen.get(chat_id, 0), anchor_id)
+
+    # EN HIZLI VE EN KESİN YOL: kullanıcı hesabı kanal geçmişini okuyabilir,
+    # son mesajı TEK çağrıda verir. Botlar geçmiş okuyamaz — aşağıdaki pencere
+    # taraması tam da bu yüzden var.
+    #
+    # Bu yol ayrıca son_gorulen.json'a bağımlılığı kaldırıyor: o dosya kalıcı
+    # olmayan bir sunucuda (Render ücretsiz katman) her yeniden başlatmada
+    # siliniyor ve tarama tabanı anchor'a düşüyordu; hesap yolunda bunun hiç
+    # önemi kalmıyor.
+    hesap = await get_user_client()
+    if hesap is not None:
+        try:
+            varlik = await _user_entity(hesap, chat_id)
+            if varlik is not None:
+                son = await hesap.get_messages(varlik, limit=1)
+                if son:
+                    latest = max(son[0].id, floor)
+                    await remember_seen(chat_id, latest)
+                    log.info("Son mesaj hesapla bulundu: chat=%s id=%s", chat_id, latest)
+                    return latest
+        except Exception:
+            log.debug("Hesapla son mesaj okunamadı, taramaya geçiliyor", exc_info=True)
+
     client = await _get_mtproto()
     if client is not None:
         entity = await _mt_entity(client, chat_id, username)
